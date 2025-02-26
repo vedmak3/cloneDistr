@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -12,8 +13,8 @@ import (
 )
 
 const (
-	numChunks = 5 // Количество потоков
-	url       = "http://ftp.altlinux.org/pub/distributions/ALTLinux/p10/branch/"
+	numChunks = 1 // Количество потоков
+	url0      = "http://ftp.altlinux.org/pub/distributions/ALTLinux/p10/branch/"
 )
 
 var url2 string
@@ -21,7 +22,7 @@ var pool []string
 
 func loadPool() {
 	var wg sync.WaitGroup
-	numWorkers := 4
+	numWorkers := 5
 	ch := make(chan string, numWorkers)
 
 	// Запуск воркеров
@@ -43,11 +44,11 @@ func loadPool() {
 	wg.Wait()
 }
 
-func loadFile(url string, wgPool *sync.WaitGroup) {
+func loadFile(adr string, wgPool *sync.WaitGroup) {
 	defer wgPool.Done()
 
 	// Определяем размер файла
-	resp, err := http.Head(url)
+	resp, err := http.Head(adr)
 	if err != nil {
 		fmt.Println("Ошибка при получении заголовков:", err)
 		return
@@ -69,7 +70,8 @@ func loadFile(url string, wgPool *sync.WaitGroup) {
 	chunkSize := contentLength / numChunks
 	var wg sync.WaitGroup
 
-	fileName := url[strings.LastIndex(url, "/")+1:]
+	fileName := adr[strings.LastIndex(adr, "/")+1:]
+	fileName, _ = url.QueryUnescape(fileName)
 	file, err := os.Create(fileName)
 	if err != nil {
 		fmt.Println("Ошибка создания файла:", err)
@@ -88,7 +90,7 @@ func loadFile(url string, wgPool *sync.WaitGroup) {
 				end = contentLength - 1
 			}
 
-			req, err := http.NewRequest("GET", url, nil)
+			req, err := http.NewRequest("GET", adr, nil)
 			if err != nil {
 				fmt.Println("Ошибка создания запроса:", err)
 				return
@@ -192,10 +194,10 @@ func main() {
 	fmt.Scan(&zn)
 	if zn == "1" {
 		fmt.Println("Выбрана архитектура x86_64")
-		url2 = url + "x86_64/RPMS.classic/"
+		url2 = url0 + "x86_64/RPMS.classic/"
 	} else if zn == "2" {
 		fmt.Println("Выбрана архитектура noarch")
-		url2 = url + "noarch/RPMS.classic/"
+		url2 = url0 + "noarch/RPMS.classic/"
 	} else {
 		fmt.Println("Некорректный выбор")
 		return

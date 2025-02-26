@@ -161,6 +161,7 @@ func parsing(str string) {
 	matches := re.FindStringSubmatch(str)
 	if matches != nil {
 		fileName := matches[1]
+		fileName, _ = url.QueryUnescape(fileName)
 		fileSizeStr := matches[3]
 
 		infoSize, err := strconv.Atoi(fileSizeStr)

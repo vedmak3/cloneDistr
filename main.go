@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,26 +11,46 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
-	numChunks = 1 // Количество потоков
-	url0      = "http://ftp.altlinux.org/pub/distributions/ALTLinux/p10/branch/"
+	numChunks  = 4 // Увеличено для многопоточной загрузки
+	numWorkers = 5
+	url0       = "http://ftp.altlinux.org/pub/distributions/ALTLinux/p10/branch/"
 )
 
 var url2 string
 var pool []string
+var poolMutex sync.Mutex
+var client = &http.Client{Timeout: 15 * time.Second} // Общий HTTP-клиент
+
+type fileContext struct {
+	wg            *sync.WaitGroup
+	fileURL       string
+	chunkSize     int
+	contentLength int
+	fileName      string
+}
 
 func loadPool() {
 	var wg sync.WaitGroup
-	numWorkers := 5
 	ch := make(chan string, numWorkers)
 
 	// Запуск воркеров
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			for fileURL := range ch {
-				loadFile(fileURL, &wg)
+				fileCont := fileContext{wg: &wg, fileURL: fileURL}
+				err := fileCont.initLoad()
+				if err != nil {
+					wg.Done()
+					fmt.Println(err)
+					continue
+				} else {
+					fileCont.loadChunks()
+				}
+
 			}
 		}()
 	}
@@ -44,120 +65,8 @@ func loadPool() {
 	wg.Wait()
 }
 
-func loadFile(adr string, wgPool *sync.WaitGroup) {
-	defer wgPool.Done()
-
-	// Определяем размер файла
-	resp, err := http.Head(adr)
-	if err != nil {
-		fmt.Println("Ошибка при получении заголовков:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	contentLengthStr := resp.Header.Get("Content-Length")
-	if contentLengthStr == "" {
-		fmt.Println("Ошибка: Content-Length отсутствует")
-		return
-	}
-
-	contentLength, err := strconv.Atoi(contentLengthStr)
-	if err != nil {
-		fmt.Println("Ошибка получения размера файла:", err)
-		return
-	}
-
-	chunkSize := contentLength / numChunks
-	var wg sync.WaitGroup
-
-	fileName := adr[strings.LastIndex(adr, "/")+1:]
-	fileName, _ = url.QueryUnescape(fileName)
-	file, err := os.Create(fileName)
-	if err != nil {
-		fmt.Println("Ошибка создания файла:", err)
-		return
-	}
-	file.Close()
-
-	// Загружаем файл частями в горутинах
-	for i := 0; i < numChunks; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			start := i * chunkSize
-			end := start + chunkSize - 1
-			if i == numChunks-1 {
-				end = contentLength - 1
-			}
-
-			req, err := http.NewRequest("GET", adr, nil)
-			if err != nil {
-				fmt.Println("Ошибка создания запроса:", err)
-				return
-			}
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-			client := &http.Client{}
-			resp, err := client.Do(req)
-			if err != nil {
-				fmt.Println("Ошибка скачивания части:", err)
-				return
-			}
-			defer resp.Body.Close()
-
-			// Открываем файл для записи
-			file, err := os.OpenFile(fileName, os.O_WRONLY, 0644)
-			if err != nil {
-				fmt.Println("Ошибка открытия файла:", err)
-				return
-			}
-			defer file.Close()
-
-			// Перемещаемся в нужное место
-			_, err = file.Seek(int64(start), 0)
-			if err != nil {
-				fmt.Println("Ошибка seek:", err)
-				return
-			}
-
-			_, err = io.Copy(file, resp.Body)
-			if err != nil {
-				fmt.Println("Ошибка записи в файл:", err)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	fmt.Println("Файл успешно скачан:", fileName)
-}
-
-func loadSp() {
-	resp, err := http.Get(url2)
-	if err != nil {
-		fmt.Println("Ошибка загрузки списка файлов:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Ошибка чтения тела ответа:", err)
-		return
-	}
-
-	mas := strings.Split(string(b), "\n")
-	for _, line := range mas {
-		if strings.Contains(line, ".rpm") {
-			parsing(line)
-		}
-	}
-
-	loadPool()
-}
-
 func parsing(str string) {
-	re := regexp.MustCompile(`<a href="([^"]+)">.*?</a>\s+(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2})\s+(\d+)`)
-
+	re := regexp.MustCompile(`<a href="([^\"]+)">.*?</a>\s+(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2})\s+(\d+)`)
 	matches := re.FindStringSubmatch(str)
 	if matches != nil {
 		fileName := matches[1]
@@ -186,6 +95,117 @@ func parsing(str string) {
 	}
 }
 
+func (fc *fileContext) initLoad() error {
+	resp, err := client.Head(fc.fileURL)
+	if err != nil {
+		return errors.New("ошибка при получении заголовков")
+	}
+	defer resp.Body.Close()
+
+	contentLengthStr := resp.Header.Get("Content-Length")
+	if contentLengthStr == "" {
+		return errors.New("Content-Length отсутствует")
+	}
+
+	contentLength, err := strconv.Atoi(contentLengthStr)
+	if err != nil {
+		return errors.New("ошибка получения размера файла")
+	}
+
+	fc.contentLength = contentLength
+	fc.chunkSize = contentLength / numChunks
+
+	fc.fileName = fc.fileURL[strings.LastIndex(fc.fileURL, "/")+1:]
+	fc.fileName, _ = url.QueryUnescape(fc.fileName)
+	file, err := os.Create(fc.fileName)
+	if err != nil {
+		return errors.New("ошибка создания файла " + fc.fileName)
+	}
+	file.Close()
+	return nil
+}
+
+func (fc *fileContext) loadChunks() {
+	defer fc.wg.Done()
+	var wg sync.WaitGroup
+
+	for i := 0; i < numChunks; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			retries := 3
+			for retry := 0; retry < retries; retry++ {
+				start := i * fc.chunkSize
+				end := start + fc.chunkSize - 1
+				if i == numChunks-1 {
+					end = fc.contentLength - 1
+				}
+
+				req, err := http.NewRequest("GET", fc.fileURL, nil)
+				if err != nil {
+					fmt.Printf("Ошибка создания запроса: %v\n", err)
+					continue
+				}
+				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+				resp, err := client.Do(req)
+				if err != nil {
+					fmt.Printf("Ошибка скачивания части: %v\n", err)
+					continue
+				}
+				defer resp.Body.Close()
+
+				file, err := os.OpenFile(fc.fileName, os.O_WRONLY, 0777)
+				if err != nil {
+					fmt.Printf("Ошибка открытия файла: %v\n", err)
+					continue
+				}
+				defer file.Close()
+
+				_, err = file.Seek(int64(start), 0)
+				if err != nil {
+					fmt.Printf("Ошибка seek: %v\n", err)
+					continue
+				}
+
+				_, err = io.Copy(file, resp.Body)
+				if err != nil {
+					fmt.Printf("Ошибка записи в файл: %v\n", err)
+					continue
+				}
+
+				break // Успешная загрузка, выходим из цикла повторных попыток
+			}
+		}(i)
+	}
+	wg.Wait()
+	fmt.Println("Файл успешно скачан:", fc.fileName)
+}
+
+func loadSp() {
+	resp, err := http.Get(url2)
+	if err != nil {
+		fmt.Println("Ошибка загрузки списка файлов:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("Ошибка чтения тела ответа:", err)
+		return
+	}
+
+	mas := strings.Split(string(b), "\n")
+	for _, line := range mas {
+		if strings.Contains(line, ".rpm") {
+			parsing(line)
+		}
+	}
+
+	loadPool()
+}
+
 func main() {
 	fmt.Println("Выберите архитектуру")
 	fmt.Println("1. x86_64")
@@ -193,13 +213,12 @@ func main() {
 
 	var zn string
 	fmt.Scan(&zn)
-	if zn == "1" {
-		fmt.Println("Выбрана архитектура x86_64")
+	switch zn {
+	case "1":
 		url2 = url0 + "x86_64/RPMS.classic/"
-	} else if zn == "2" {
-		fmt.Println("Выбрана архитектура noarch")
+	case "2":
 		url2 = url0 + "noarch/RPMS.classic/"
-	} else {
+	default:
 		fmt.Println("Некорректный выбор")
 		return
 	}
